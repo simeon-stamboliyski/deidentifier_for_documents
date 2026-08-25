@@ -36,6 +36,7 @@ private:
     void detectRegex(const std::string& text, std::vector<DetectedEntity>& results) const;
     void detectDictionaries(const std::string& text, std::vector<DetectedEntity>& results) const;
     void detectNER(const std::string& text, std::vector<DetectedEntity>& results) const;
+    void detectEGN(const std::string& text, std::vector<DetectedEntity>& results) const;
 
     std::vector<std::pair<EntityType, std::regex>> regexes_;
     std::vector<std::pair<EntityType, std::vector<std::string>>> dictionaries_;

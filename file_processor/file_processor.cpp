@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <set>
@@ -23,12 +24,101 @@ std::string normalizedExtension(const fs::path& path) {
     return extension;
 }
 
-bool isSupportedTextProcessor(const fs::path& path) {
-    const std::string extension = normalizedExtension(path);
-    return extension == ".txt" || extension == ".md" || extension == ".csv";
-}
+class TextDocumentParser : public IDocumentParser {
+public:
+    std::string extractText(const fs::path& filePath) override {
+        std::ifstream input(filePath, std::ios::binary);
+        if (!input) return "";
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        return buffer.str();
+    }
+
+    bool writeText(const fs::path& outputPath, const std::string& content) override {
+        std::ofstream output(outputPath, std::ios::binary);
+        if (!output) return false;
+        output << content;
+        return output.good();
+    }
+};
+
+class CsvDocumentParser : public TextDocumentParser {
+public:
+    std::string extractText(const fs::path& filePath) override {
+        return TextDocumentParser::extractText(filePath);
+    }
+
+    bool writeText(const fs::path& outputPath, const std::string& content) override {
+        return TextDocumentParser::writeText(outputPath, content);
+    }
+};
+
+class BinaryDocumentParser : public IDocumentParser {
+public:
+    explicit BinaryDocumentParser(std::string ext) : ext_(std::move(ext)) {}
+
+    std::string extractText(const fs::path& filePath) override {
+        std::string command;
+        fs::path tempOutput = fs::temp_directory_path() / "deid_extracted.txt";
+
+        if (ext_ == ".pdf") {
+            command = "pdftotext \"" + filePath.string() + "\" \"" + tempOutput.string() + "\" 2>/dev/null";
+        } else if (ext_ == ".docx" || ext_ == ".doc") {
+            command = "pandoc \"" + filePath.string() + "\" -t plain -o \"" + tempOutput.string() + "\" 2>/dev/null";
+        }
+
+        if (!command.empty() && std::system(command.c_str()) == 0 && fs::exists(tempOutput)) {
+            TextDocumentParser textParser;
+            std::string extracted = textParser.extractText(tempOutput);
+            fs::remove(tempOutput);
+            if (!extracted.empty()) return extracted;
+        }
+
+        TextDocumentParser fallback;
+        return fallback.extractText(filePath);
+    }
+
+    bool writeText(const fs::path& outputPath, const std::string& content) override {
+        fs::path tempTxt = fs::temp_directory_path() / "deid_temp_output.txt";
+        {
+            std::ofstream tempOut(tempTxt, std::ios::binary);
+            if (!tempOut) return false;
+            tempOut << content;
+        }
+
+        std::string command = "pandoc \"" + tempTxt.string() + "\" -o \"" + outputPath.string() + "\" 2>/dev/null";
+
+        bool success = false;
+        if (std::system(command.c_str()) == 0 && fs::exists(outputPath)) {
+            success = true;
+        } else {
+            std::ofstream output(outputPath, std::ios::binary);
+            if (output) {
+                output << content;
+                success = output.good();
+            }
+        }
+
+        fs::remove(tempTxt);
+        return success;
+    }
+
+private:
+    std::string ext_;
+};
 
 } // namespace
+
+std::unique_ptr<IDocumentParser> createParserForExtension(const std::string& extension) {
+    if (extension == ".txt" || extension == ".md") {
+        return std::make_unique<TextDocumentParser>();
+    } else if (extension == ".csv") {
+        return std::make_unique<CsvDocumentParser>();
+    } else if (extension == ".pdf" || extension == ".doc" || extension == ".docx") {
+        return std::make_unique<BinaryDocumentParser>(extension);
+    }
+    return nullptr;
+}
 
 fs::path getInputFolder(int argc, char* argv[]) {
     if (argc >= 2) {
@@ -92,23 +182,20 @@ FileResult processFile(
     const fs::path& outputRoot,
     Deidentifier& deidentifier
 ) {
-    if (!isSupportedTextProcessor(inputFile)) {
-        return {FileStatus::Skipped, 0,
-            "Skipped: format requires binary/document parser (DOC/DOCX/PDF)."};
+    const std::string ext = normalizedExtension(inputFile);
+    auto parser = createParserForExtension(ext);
+    
+    if (!parser) {
+        return {FileStatus::Skipped, 0, "Skipped: unhandled file extension."};
     }
 
-    std::ifstream input(inputFile, std::ios::binary);
-    if (!input) {
-        return {FileStatus::Failed, 0, "Failed: could not read file."};
+    std::string rawContent = parser->extractText(inputFile);
+    if (rawContent.empty()) {
+        return {FileStatus::Failed, 0, "Failed: could not read or extract document text."};
     }
 
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
+    const std::string cleanedContent = MetadataProcessor::stripMetadata(rawContent, inputFile);
 
-    // 1. Metadata inspection and removal
-    const std::string cleanedContent = MetadataProcessor::stripMetadata(buffer.str(), inputFile);
-
-    // 2. Detection, overlap resolution, and consistency-preserving replacement
     const auto deidentified = deidentifier.deidentifyText(cleanedContent);
 
     std::error_code error;
@@ -123,18 +210,12 @@ FileResult processFile(
         return {FileStatus::Failed, 0, "Failed: could not create output folder."};
     }
 
-    std::ofstream output(outputFile, std::ios::binary);
-    if (!output) {
-        return {FileStatus::Failed, 0, "Failed: could not write output file."};
-    }
-
-    output << deidentified.text;
-    if (!output) {
-        return {FileStatus::Failed, 0, "Failed: writing output file was incomplete."};
+    if (!parser->writeText(outputFile, deidentified.text)) {
+        return {FileStatus::Failed, 0, "Failed: writing deidentified document failed."};
     }
 
     return {FileStatus::Processed, deidentified.redactions,
-        "Processed: " + std::to_string(deidentified.redactions) + " redaction(s)."};
+        "Processed (" + ext + "): " + std::to_string(deidentified.redactions) + " redaction(s)."};
 }
 
 void addToSummary(ProcessingSummary& summary, const FileResult& result) {

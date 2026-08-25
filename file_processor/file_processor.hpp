@@ -2,9 +2,9 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
-
 
 namespace deid {
 
@@ -26,6 +26,15 @@ struct ProcessingSummary {
     std::size_t redactions = 0;
 };
 
+class IDocumentParser {
+public:
+    virtual ~IDocumentParser() = default;
+    virtual std::string extractText(const fs::path& filePath) = 0;
+    virtual bool writeText(const fs::path& outputPath, const std::string& content) = 0;
+};
+
+std::unique_ptr<IDocumentParser> createParserForExtension(const std::string& extension);
+
 fs::path getInputFolder(int argc, char* argv[]);
 fs::path createOutputFolder(const fs::path& inputFolder);
 std::vector<fs::path> findSupportedFiles(const fs::path& inputFolder);
@@ -39,4 +48,4 @@ FileResult processFile(
 
 void addToSummary(ProcessingSummary& summary, const FileResult& result);
 
-}
+} // namespace deid
